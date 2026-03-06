@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = (SCRIPT_DIR / "log_traces").resolve()
-DEFAULT_OUTPUT = (DEFAULT_ROOT / "perf_context_level_metadata.csv").resolve()
+DEFAULT_OUTPUT = (DEFAULT_ROOT / "perf_parsed.csv").resolve()
 
 
 METRICS = [

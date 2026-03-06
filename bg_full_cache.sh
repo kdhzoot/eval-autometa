@@ -2,38 +2,71 @@
 
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
+usage() {
   cat <<'USAGE'
 Usage:
-  ./bg_cache_trace.sh <db_name_or_path> <db_size>
+  ./bg_full_cache.sh <db_path> <db_size>
+  DB_INPUT=<db_path> DB_SIZE=<db_size> ./bg_full_cache.sh
 
 Examples:
   # full filter DB directories under /work/background
   # 500GB DB: /work/background/500gb_full_filter
   # 1TB DB:   /work/background/1000gb_full_filter
-  ./bg_cache_trace.sh /work/background/500gb_full_filter 500gb
-  ./bg_cache_trace.sh /work/background/1000gb_full_filter 1tb
+  ./bg_full_cache.sh /work/background/500gb_full_filter 500gb
+  ./bg_full_cache.sh /work/background/1000gb_full_filter 1tb
   # when available for 2TB:
-  ./bg_cache_trace.sh /work/background/2000gb_full_filter 2tb
+  ./bg_full_cache.sh /work/background/2000gb_full_filter 2tb
+
+Environment overrides:
+  DB_BENCH, LOG_ROOT, THREADS, DURATION_SECONDS, PERF_LEVEL,
+  READ_KEYS_CAP, READ_KEYS, CACHE_PERCENTAGES, DROP_CACHE,
+  MAX_OPEN_FILES_LIMIT, WORKLOAD
+
+NUMA policy:
+  This script is fixed to use numactl on node 0 only.
+
+WORKLOAD:
+  allrandom | prefixdist | readrandom
 USAGE
+}
+
+if [[ $# -gt 2 ]]; then
+  usage
   exit 1
 fi
 
-DB_INPUT="$1"
+DB_INPUT="${1:-${DB_INPUT:-}}"
+DB_SIZE_INPUT_RAW="${2:-${DB_SIZE:-}}"
+if [[ -z "${DB_INPUT}" || -z "${DB_SIZE_INPUT_RAW}" ]]; then
+  usage
+  exit 1
+fi
+DB_SIZE_INPUT="$(echo "$DB_SIZE_INPUT_RAW" | tr '[:upper:]' '[:lower:]')"
 FILTER_KIND="full"
-DB_SIZE_INPUT="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
 
-# ----- editable settings -----
-DB_BENCH="/home/smrc/autometa/rocksdb/db_bench"
-LOG_ROOT="log_traces"
-THREADS=48
-DURATION_SECONDS=300
-PERF_LEVEL=2
-READ_KEYS_CAP=1000000000
+# ----- configurable settings -----
+DB_BENCH="${DB_BENCH:-/home/smrc/autometa/rocksdb/db_bench}"
+LOG_ROOT="${LOG_ROOT:-log_traces}"
+DURATION_SECONDS="${DURATION_SECONDS:-300}"
+PERF_LEVEL="${PERF_LEVEL:-2}"
+READ_KEYS_CAP="${READ_KEYS_CAP:-1000000000}"
 # If empty, READ_KEYS is auto-derived as min(NKEYS, READ_KEYS_CAP).
-READ_KEYS=""
-CACHE_PERCENTAGES=(5 2 1 0.1 0.05)
-# -----------------------------
+READ_KEYS="${READ_KEYS:-}"
+CACHE_PERCENTAGES="${CACHE_PERCENTAGES:-5 2 1 0.1 0.05}"
+THREADS="${THREADS:-24}"
+USE_NUMACTL="1"
+NUMA_NODE="0"
+DROP_CACHE="${DROP_CACHE:-1}"
+MAX_OPEN_FILES_LIMIT="${MAX_OPEN_FILES_LIMIT:-1048576}"
+WORKLOAD="$(echo "${WORKLOAD:-allrandom}" | tr '[:upper:]' '[:lower:]')"
+# -------------------------------
+
+CACHE_PERCENTAGES_NORMALIZED="$(echo "${CACHE_PERCENTAGES}" | tr ',' ' ')"
+read -r -a CACHE_PERCENTAGES_ARR <<< "${CACHE_PERCENTAGES_NORMALIZED}"
+if [[ ${#CACHE_PERCENTAGES_ARR[@]} -eq 0 ]]; then
+  echo "[ERROR] CACHE_PERCENTAGES is empty"
+  exit 1
+fi
 
 case "$DB_SIZE_INPUT" in
   500|500gb)
@@ -87,18 +120,15 @@ if [[ -z "$READ_KEYS" ]]; then
   fi
 fi
 
-ulimit -n 1048576
+ulimit -n "${MAX_OPEN_FILES_LIMIT}"
 
-if [[ "$FILTER_KIND" == "full" ]]; then
-  PARTITION_INDEX=false
-  PARTITION_FILTERS=false
-else
-  PARTITION_INDEX=true
-  PARTITION_FILTERS=true
-fi
+# full-only script
+PARTITION_INDEX=false
+PARTITION_FILTERS=false
 
 drop_page_cache() {
   local phase="$1"
+  [[ "${DROP_CACHE}" == "1" ]] || return 0
   echo "[INFO] drop page cache (${phase})"
   sync
   if [[ -w /proc/sys/vm/drop_caches ]]; then
@@ -147,6 +177,62 @@ run_one() {
   local meminfo_before="${run_dir}/meminfo.before"
   local meminfo_after="${run_dir}/meminfo.after"
   local cmd_file="${run_dir}/cmd.sh"
+  local -a workload_flags=()
+  local -a cmd_prefix=()
+  if [[ "${USE_NUMACTL}" == "1" ]]; then
+    cmd_prefix=(numactl --membind="${NUMA_NODE}" --cpunodebind="${NUMA_NODE}")
+  fi
+  case "${WORKLOAD}" in
+    allrandom)
+      workload_flags=(
+        --benchmarks=mixgraph,stats,levelstats
+        --mix_get_ratio=1
+        --mix_put_ratio=0
+        --mix_seek_ratio=0
+        --value_k=0.2615
+        --value_sigma=25.45
+        --iter_k=2.517
+        --iter_sigma=14.236
+        --sine_mix_rate_interval_milliseconds=5000
+        --sine_a=1000
+        --sine_b=0.000073
+        --sine_d=450000000
+        --keyrange_num=1
+      )
+      ;;
+    prefixdist)
+      workload_flags=(
+        --mix_get_ratio=1
+        --mix_put_ratio=0
+        --mix_seek_ratio=0
+        --value_k=0.2615
+        --value_sigma=25.45
+        --iter_k=2.517
+        --iter_sigma=14.236
+        --sine_mix_rate_interval_milliseconds=5000
+        --sine_a=1000
+        --sine_b=0.000073
+        --sine_d=450000000
+        --benchmarks=mixgraph,stats,levelstats
+        --key_dist_a=0.002312
+        --key_dist_b=0.3467
+        --keyrange_dist_a=14.18
+        --keyrange_dist_b=-2.917
+        --keyrange_dist_c=0.0164
+        --keyrange_dist_d=-0.08082
+        --keyrange_num=30
+      )
+      ;;
+    readrandom)
+      workload_flags=(
+        --benchmarks=readrandom,stats,levelstats
+      )
+      ;;
+    *)
+      echo "[ERROR] unsupported WORKLOAD: ${WORKLOAD}. expected one of: allrandom, prefixdist, readrandom" >&2
+      exit 1
+      ;;
+  esac
 
   {
     echo "run_id=${run_id}"
@@ -162,11 +248,16 @@ run_one() {
     echo "cache_bytes=${cache_bytes}"
     echo "cache_human=${cache_human}"
     echo "perf_level=${PERF_LEVEL}"
+    echo "use_numactl=${USE_NUMACTL}"
+    echo "numa_node=${NUMA_NODE}"
+    echo "drop_cache=${DROP_CACHE}"
+    echo "workload=${WORKLOAD}"
     echo "report_file=${report_file}"
   } > "${run_dir}/run.info"
 
   local -a cmd=(
-    numactl --membind=0 --cpunodebind=0 "$DB_BENCH"
+    "${cmd_prefix[@]}"
+    "$DB_BENCH"
     --threads="$THREADS"
     --max_background_compactions=32
     --max_write_buffer_number=4
@@ -202,19 +293,7 @@ run_one() {
     --cache_type=hyper_clock_cache
     --checksum_type=1
     --index_shortening_mode=1
-    --mix_get_ratio=1
-    --mix_put_ratio=0
-    --mix_seek_ratio=0
     --open_files=-1
-    --keyrange_num=1
-    --value_k=0.2615
-    --value_sigma=25.45
-    --iter_k=2.517
-    --iter_sigma=14.236
-    --sine_mix_rate_interval_milliseconds=5000
-    --sine_a=1000
-    --sine_b=0.000073
-    --sine_d=4500
     --statistics=1
     --perf_level="${PERF_LEVEL}"
     --stats_per_interval=1
@@ -222,7 +301,7 @@ run_one() {
     --report_interval_seconds=1
     --stats_interval_seconds=60
     --report_file="$report_file"
-    --benchmarks=mixgraph,stats,levelstats
+    "${workload_flags[@]}"
   )
 
   {
@@ -274,15 +353,20 @@ run_one() {
   echo "num=${NKEYS}"
   echo "filter=${FILTER_KIND}"
   echo "db_bench=${DB_BENCH}"
-  echo "cache_percentages=${CACHE_PERCENTAGES[*]}"
+  echo "cache_percentages=${CACHE_PERCENTAGES_ARR[*]}"
   echo "threads=${THREADS}"
   echo "reads=${READ_KEYS}"
   echo "reads_cap=${READ_KEYS_CAP}"
   echo "duration_seconds=${DURATION_SECONDS}"
   echo "perf_level=${PERF_LEVEL}"
+  echo "use_numactl=${USE_NUMACTL}"
+  echo "numa_node=${NUMA_NODE}"
+  echo "drop_cache=${DROP_CACHE}"
+  echo "max_open_files_limit=${MAX_OPEN_FILES_LIMIT}"
+  echo "workload=${WORKLOAD}"
 } > "${RUN_DIR}/session.info"
 
-for pct in "${CACHE_PERCENTAGES[@]}"; do
+for pct in "${CACHE_PERCENTAGES_ARR[@]}"; do
   cache_bytes="$(awk -v bytes="$DB_SIZE_BYTES" -v p="$pct" 'BEGIN { printf "%.0f", bytes * p / 100 }')"
   if [[ -z "$cache_bytes" || "$cache_bytes" -le 0 ]]; then
     echo "[ERROR] invalid cache bytes for percent=${pct}" | tee -a "${RUN_DIR}/error.log"
