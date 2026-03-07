@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 : <<'EXAMPLE'
-TARGET_DB_GB=25 KV_SIZE=91 CACHE_SIZE_GB=8 \
+TARGET_DB_GB=2300 KV_SIZE=91 CACHE_SIZE_GB=8 \
 DB_BENCH=/home/smrc/autometa/himeta/db_bench \
 DB_ROOT=/work/db USE_NUMACTL=0 NUMA_NODE=0 \
 bash load_hi.sh
@@ -12,7 +12,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   TARGET_DB_GB=<GB> \
-  KV_SIZE=<bytes> \
+  KV_SIZE=<91|1024> \
   CACHE_SIZE_GB=<GB> \
   DB_BENCH=<path> \
   DB_ROOT=<path> \
@@ -31,7 +31,16 @@ for name in TARGET_DB_GB KV_SIZE CACHE_SIZE_GB DB_BENCH DB_ROOT USE_NUMACTL NUMA
   require_env "$name"
 done
 
-[[ "${KV_SIZE}" == "91" ]] || { echo "[ERROR] KV_SIZE must be 91 (got: ${KV_SIZE})" >&2; exit 1; }
+if [[ "${KV_SIZE}" == "91" ]]; then
+  KEY_SIZE=48
+  VALUE_SIZE=43
+elif [[ "${KV_SIZE}" == "1024" ]]; then
+  KEY_SIZE=24
+  VALUE_SIZE=1000
+else
+  echo "[ERROR] KV_SIZE must be 91 or 1024 (got: ${KV_SIZE})" >&2
+  exit 1
+fi
 [[ "${USE_NUMACTL}" == "0" || "${USE_NUMACTL}" == "1" ]] || { echo "[ERROR] USE_NUMACTL must be 0 or 1" >&2; exit 1; }
 [[ "${USE_NUMACTL}" == "0" ]] || command -v numactl >/dev/null 2>&1 || { echo "[ERROR] numactl not found" >&2; exit 1; }
 
@@ -45,12 +54,11 @@ OPTIONS_FILE="${RUN_DIR}/default.options"
 RAW_DIR="${RUN_DIR}/raw"
 CMD_FILE="${RAW_DIR}/load_cmd.sh"
 
-KEY_SIZE=48
-VALUE_SIZE=43
 MIB=$((1024 * 1024))
 CACHE_BYTES=$((1024 * 1024 * 1024 * CACHE_SIZE_GB))
 DB_SIZE_BYTES=$((TARGET_DB_GB * 1024 * 1024 * 1024))
 NKEYS=$((DB_SIZE_BYTES / KV_SIZE))
+LOAD_THREADS=1
 
 [[ ! -d "${DB_DIR}" ]] || { echo "[ERROR] DB already exists: ${DB_DIR}" >&2; exit 1; }
 mkdir -p "${RUN_DIR}" "${DB_DIR}"
@@ -71,6 +79,7 @@ cmd=(
   --stats_per_interval=1
   --report_interval_seconds=10
   --report_file="${RUN_DIR}/default.rep"
+  --threads="${LOAD_THREADS}"
   --cache_type=hyper_clock_cache
   --cache_size="${CACHE_BYTES}"
   --cache_numshardbits=-1
@@ -79,22 +88,25 @@ cmd=(
   --index_shortening_mode=1
   --bloom_bits=10
   --disable_wal=true
-  --open_files=20
-  --max_write_buffer_number=20
-  --write_buffer_size=$((MIB * 64))
-  --max_background_jobs=96
-  --level0_file_num_compaction_trigger=4
-  --level0_slowdown_writes_trigger=20
-  --level0_stop_writes_trigger=36
+  --open_files=-1
+  --max_write_buffer_number=50
+  --write_buffer_size=$((MIB * 512))
+  --min_write_buffer_number_to_merge=1
+  --max_background_jobs=48
+  --level0_file_num_compaction_trigger=8
+  --level0_slowdown_writes_trigger=24
+  --level0_stop_writes_trigger=40
   --block_size=4096
   --writable_file_max_buffer_size=$((MIB * 64))
-  --compaction_readahead_size=0
+  --compaction_readahead_size=$((MIB * 2))
   --compaction_style=0
   --max_bytes_for_level_base=$((MIB * 256))
   --target_file_size_base=$((MIB * 64))
   --num="${NKEYS}"
   --key_size="${KEY_SIZE}"
   --value_size="${VALUE_SIZE}"
+  --memtablerep=vector
+  --allow_concurrent_memtable_write=false
   --seed=12345678
   --db="${DB_DIR}"
   --ttl_seconds=$((60 * 60 * 24 * 30 * 12))
@@ -116,6 +128,7 @@ cmd=(
   echo "db_bench=${DB_BENCH}"
   echo "use_numactl=${USE_NUMACTL}"
   echo "numa_node=${NUMA_NODE}"
+  echo "load_threads=${LOAD_THREADS}"
   echo "max_open_files_limit=${MAX_OPEN_FILES_LIMIT}"
   echo "key_size=${KEY_SIZE}"
   echo "value_size=${VALUE_SIZE}"
