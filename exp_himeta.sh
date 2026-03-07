@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 : <<'EXAMPLE'
-DB_DIR=/work/background/500gb_full_filter DB_SIZE=500gb \
-DB_BENCH=/home/smrc/autometa/rocksdb/db_bench \
+DB_DIR=/work/background/500gb_full_filter NUM=5000000000 \
+DB_BENCH=/home/smrc/autometa/himeta/db_bench \
 CACHE_PERCENTAGES='5 2 1 0.1 0.05' THREADS=24 DURATION_SECONDS=300 PERF_LEVEL=2 \
-WORKLOAD=allrandom USE_NUMACTL=1 NUMA_NODE=0 \
-bash bg_full_cache.sh
+WORKLOAD='prefixdist readrandom ycsbc' \
+YCSB_REQUEST_DISTRIBUTION=zipfian \
+USE_NUMACTL=1 NUMA_NODE=0 \
+bash exp_himeta.sh
 EXAMPLE
 
 set -euo pipefail
@@ -13,16 +15,17 @@ usage() {
   cat <<'USAGE'
 Usage:
   DB_DIR=<existing_db_path> \
-  DB_SIZE=<500gb|1tb|2tb> \
+  NUM=<nkeys> \
   DB_BENCH=<path> \
   CACHE_PERCENTAGES='<p1 p2 ...>' \
   THREADS=<n> \
   DURATION_SECONDS=<sec> \
   PERF_LEVEL=<n> \
-  WORKLOAD=<allrandom|prefixdist|readrandom> \
+  WORKLOAD='<prefixdist|readrandom|ycsbc|...>' \
+  YCSB_REQUEST_DISTRIBUTION=<uniform|zipfian> \
   USE_NUMACTL=<0|1> \
   NUMA_NODE=<node> \
-  bash bg_full_cache.sh
+  bash exp_himeta.sh
 USAGE
 }
 
@@ -31,7 +34,7 @@ require_env() {
   [[ -n "${!name+x}" ]] || { echo "[ERROR] Missing required env: ${name}" >&2; usage >&2; exit 1; }
 }
 
-for name in DB_DIR DB_SIZE DB_BENCH CACHE_PERCENTAGES THREADS DURATION_SECONDS PERF_LEVEL WORKLOAD USE_NUMACTL NUMA_NODE; do
+for name in DB_DIR NUM DB_BENCH CACHE_PERCENTAGES THREADS DURATION_SECONDS PERF_LEVEL WORKLOAD YCSB_REQUEST_DISTRIBUTION USE_NUMACTL NUMA_NODE; do
   require_env "$name"
 done
 
@@ -40,50 +43,36 @@ done
 [[ "${USE_NUMACTL}" == "0" || "${USE_NUMACTL}" == "1" ]] || { echo "[ERROR] USE_NUMACTL must be 0 or 1" >&2; exit 1; }
 [[ "${USE_NUMACTL}" == "0" ]] || command -v numactl >/dev/null 2>&1 || { echo "[ERROR] numactl not found" >&2; exit 1; }
 
-WORKLOAD="$(echo "${WORKLOAD}" | tr '[:upper:]' '[:lower:]')"
-case "${WORKLOAD}" in
-  allrandom|prefixdist|readrandom) ;;
-  *)
-    echo "[ERROR] unsupported WORKLOAD: ${WORKLOAD}. expected: allrandom, prefixdist, readrandom" >&2
-    exit 1
-    ;;
-esac
-
-DB_SIZE_INPUT="$(echo "${DB_SIZE}" | tr '[:upper:]' '[:lower:]')"
-case "${DB_SIZE_INPUT}" in
-  500|500gb)
-    DB_SIZE_LABEL="500GB"
-    DB_SIZE_BYTES=$((500 * 1024 * 1024 * 1024))
-    NKEYS=5000000000
-    ;;
-  1tb|1000gb|1024gb)
-    DB_SIZE_LABEL="1TB"
-    DB_SIZE_BYTES=$((1024 * 1024 * 1024 * 1024))
-    NKEYS=10000000000
-    ;;
-  2tb|2000gb|2048gb|2t)
-    DB_SIZE_LABEL="2TB"
-    DB_SIZE_BYTES=$((2048 * 1024 * 1024 * 1024))
-    NKEYS=20000000000
-    ;;
-  *)
-    echo "[ERROR] DB_SIZE must be one of: 500gb, 1tb, 2tb (got: ${DB_SIZE})" >&2
-    exit 1
-    ;;
-esac
+[[ "${NUM}" =~ ^[0-9]+$ ]] || { echo "[ERROR] NUM must be an integer (got: ${NUM})" >&2; exit 1; }
+[[ "${NUM}" -gt 0 ]] || { echo "[ERROR] NUM must be > 0 (got: ${NUM})" >&2; exit 1; }
 
 CACHE_PERCENTAGES_NORMALIZED="$(echo "${CACHE_PERCENTAGES}" | tr ',' ' ')"
 read -r -a CACHE_PERCENTAGES_ARR <<< "${CACHE_PERCENTAGES_NORMALIZED}"
 [[ ${#CACHE_PERCENTAGES_ARR[@]} -gt 0 ]] || { echo "[ERROR] CACHE_PERCENTAGES is empty" >&2; exit 1; }
 
-LOG_ROOT="log_traces"
+WORKLOAD_NORMALIZED="$(echo "${WORKLOAD}" | tr ',' ' ' | tr '[:upper:]' '[:lower:]')"
+read -r -a WORKLOADS <<< "${WORKLOAD_NORMALIZED}"
+[[ ${#WORKLOADS[@]} -gt 0 ]] || { echo "[ERROR] WORKLOAD is empty" >&2; exit 1; }
+for w in "${WORKLOADS[@]}"; do
+  [[ "${w}" == "prefixdist" || "${w}" == "readrandom" || "${w}" == "ycsbc" ]] || {
+    echo "[ERROR] WORKLOAD must contain only: prefixdist, readrandom, ycsbc (got: ${w})" >&2
+    exit 1
+  }
+done
+YCSB_REQUEST_DISTRIBUTION="$(echo "${YCSB_REQUEST_DISTRIBUTION}" | tr '[:upper:]' '[:lower:]')"
+[[ "${YCSB_REQUEST_DISTRIBUTION}" == "uniform" || "${YCSB_REQUEST_DISTRIBUTION}" == "zipfian" ]] || {
+  echo "[ERROR] YCSB_REQUEST_DISTRIBUTION must be uniform or zipfian (got: ${YCSB_REQUEST_DISTRIBUTION})" >&2
+  exit 1
+}
+
+LOG_ROOT="log_exp"
 MAX_OPEN_FILES_LIMIT=1048576
 RUN_TS="$(date '+%y%m%d_%H%M')"
-RUN_DIR="${LOG_ROOT}/perf_${RUN_TS}_full_${DB_SIZE_LABEL}"
+RUN_DIR="${LOG_ROOT}/exp_himeta_${RUN_TS}_num${NUM}"
 
 MIB=$((1024 * 1024))
 WF_BYTES=$((64 * 1024 * 1024))
-SEED=12345678
+SEED=87654321
 BASE_NAME="$(basename "${DB_DIR}")"
 PARTITION_INDEX=false
 PARTITION_FILTERS=false
@@ -116,23 +105,22 @@ drop_page_cache() {
 }
 
 run_one() {
-  local cache_label="$1"
-  local cache_bytes="$2"
-  local cache_human pct_label run_id run_dir
-  local out_prefix out_file options_file report_file raw_dir cmd_file
+  local workload="$1"
+  local cache_label="$2"
+  local cache_bytes="$3"
+  local pct_label run_id run_dir
+  local out_file options_file report_file raw_dir cmd_file
   local start_ts end_ts elapsed_sec
   local -a workload_flags=()
   local -a cmd_prefix=()
 
-  cache_human="$(format_bytes "${cache_bytes}")"
   pct_label="${cache_label//./p}"
-  run_id="full_${pct_label}"
+  run_id="${workload}_${pct_label}"
   run_dir="${RUN_DIR}/${run_id}"
 
-  out_prefix="${run_dir}/${BASE_NAME}.full.${pct_label}"
-  out_file="${out_prefix}.out"
-  options_file="${out_prefix}.options"
-  report_file="${out_prefix}.rep"
+  out_file="${run_dir}/default.out"
+  options_file="${run_dir}/default.options"
+  report_file="${run_dir}/default.rep"
   raw_dir="${run_dir}/raw"
   cmd_file="${raw_dir}/load_cmd.sh"
 
@@ -142,24 +130,7 @@ run_one() {
     cmd_prefix=(numactl --membind="${NUMA_NODE}" --cpunodebind="${NUMA_NODE}")
   fi
 
-  case "${WORKLOAD}" in
-    allrandom)
-      workload_flags=(
-        --benchmarks=mixgraph,stats,levelstats
-        --mix_get_ratio=1
-        --mix_put_ratio=0
-        --mix_seek_ratio=0
-        --value_k=0.2615
-        --value_sigma=25.45
-        --iter_k=2.517
-        --iter_sigma=14.236
-        --sine_mix_rate_interval_milliseconds=5000
-        --sine_a=1000
-        --sine_b=0.000073
-        --sine_d=4500
-        --keyrange_num=1
-      )
-      ;;
+  case "${workload}" in
     prefixdist)
       workload_flags=(
         --benchmarks=mixgraph,stats,levelstats
@@ -188,54 +159,64 @@ run_one() {
         --benchmarks=readrandom,stats,levelstats
       )
       ;;
+    ycsbc)
+      workload_flags=(
+        --benchmarks=workloadc,stats,levelstats
+        --ycsb_requestdistribution="${YCSB_REQUEST_DISTRIBUTION}"
+      )
+      ;;
+    *)
+      echo "[ERROR] unsupported workload: ${workload}" >&2
+      exit 1
+      ;;
   esac
 
   cmd=(
     "${cmd_prefix[@]}"
     "${DB_BENCH}"
-    --threads="${THREADS}"
-    --max_background_compactions=32
-    --max_write_buffer_number=4
+    --statistics=1
+    --stats_interval_seconds=60
+    --stats_per_interval=1
+    --report_interval_seconds=10
+    --report_file="${report_file}"
+    --cache_type=hyper_clock_cache
+    --cache_size="${cache_bytes}"
+    --cache_numshardbits=-1
     --cache_index_and_filter_blocks=true
+    --index_shortening_mode=1
     --bloom_bits=10
+    --disable_wal=true
+    --open_files=20
+    --max_write_buffer_number=20
+    --write_buffer_size=$((MIB * 64))
+    --max_background_jobs=48
+    --block_size=4096
+    --writable_file_max_buffer_size="${WF_BYTES}"
+    --compaction_readahead_size=0
+    --compaction_style=0
+    --max_bytes_for_level_base=$((MIB * 256))
+    --target_file_size_base=$((MIB * 64))
     --partition_index="${PARTITION_INDEX}"
     --partition_index_and_filters="${PARTITION_FILTERS}"
     --pin_top_level_index_and_filter=false
     --pin_l0_filter_and_index_blocks_in_cache=false
-    --num="${NKEYS}"
-    --reads="${NKEYS}"
+    --num="${NUM}"
+    --reads="${NUM}"
+    --threads="${THREADS}"
     --duration="${DURATION_SECONDS}"
-    --disable_wal=false
-    --block_size=4096
-    --num_levels=7
-    --use_direct_reads=true
-    --use_direct_io_for_flush_and_compaction=true
-    --writable_file_max_buffer_size="${WF_BYTES}"
-    --cache_numshardbits=-1
-    --compaction_readahead_size=0
-    --compaction_style=0
-    --write_buffer_size=$((MIB * 64))
-    --max_bytes_for_level_base=$((MIB * 256))
-    --target_file_size_base=$((MIB * 64))
-    --compression_type=none
     --key_size=48
     --value_size=43
     --seed="${SEED}"
     --db="${DB_DIR}"
     --use_existing_db=1
-    --cache_size="${cache_bytes}"
-    --sync=0
-    --cache_type=hyper_clock_cache
+    --use_direct_reads=true
+    --use_direct_io_for_flush_and_compaction=true
+    --compression_type=none
     --checksum_type=1
-    --index_shortening_mode=1
-    --open_files=-1
-    --statistics=1
+    --use-himeta-scheme=true
+    --sync=0
     --perf_level="${PERF_LEVEL}"
-    --stats_per_interval=1
     --stats_level=3
-    --report_interval_seconds=1
-    --stats_interval_seconds=60
-    --report_file="${report_file}"
     "${workload_flags[@]}"
   )
 
@@ -244,23 +225,28 @@ run_one() {
     echo "run_dir=${RUN_DIR}"
     echo "run_id=${run_id}"
     echo "db_dir=${DB_DIR}"
-    echo "db_size=${DB_SIZE_LABEL}"
-    echo "db_size_bytes=${DB_SIZE_BYTES}"
-    echo "num=${NKEYS}"
     echo "db_bench=${DB_BENCH}"
-    echo "threads=${THREADS}"
-    echo "reads=${NKEYS}"
-    echo "duration_seconds=${DURATION_SECONDS}"
-    echo "perf_level=${PERF_LEVEL}"
-    echo "cache_label=${cache_label}"
-    echo "cache_bytes=${cache_bytes}"
-    echo "cache_human=${cache_human}"
-    echo "partition_index=${PARTITION_INDEX}"
-    echo "partition_index_and_filters=${PARTITION_FILTERS}"
     echo "use_numactl=${USE_NUMACTL}"
     echo "numa_node=${NUMA_NODE}"
-    echo "workload=${WORKLOAD}"
+    echo "max_open_files_limit=${MAX_OPEN_FILES_LIMIT}"
+    echo "key_size=48"
+    echo "value_size=43"
+    echo "num=${NUM}"
+    echo "cache_bytes=${cache_bytes}"
+    echo "cache_label=${cache_label}"
+    echo "threads=${THREADS}"
+    echo "reads=${NUM}"
+    echo "duration_seconds=${DURATION_SECONDS}"
+    echo "perf_level=${PERF_LEVEL}"
+    echo "partition_index=${PARTITION_INDEX}"
+    echo "partition_index_and_filters=${PARTITION_FILTERS}"
+    echo "workload=${workload}"
+    if [[ "${workload}" == "ycsbc" ]]; then
+      echo "ycsb_requestdistribution=${YCSB_REQUEST_DISTRIBUTION}"
+    fi
     echo "report_file=${report_file}"
+    echo "benchmarks=$(printf '%s ' "${workload_flags[@]}" | sed 's/[[:space:]]*$//')"
+    echo "use_himeta_scheme=true"
   } > "${options_file}"
 
   {
@@ -274,7 +260,6 @@ run_one() {
     printf '%q ' "${cmd[@]}"
     echo
   } > "${cmd_file}"
-  chmod +x "${cmd_file}"
 
   drop_page_cache "before-${run_id}"
 
@@ -282,29 +267,20 @@ run_one() {
   echo "${start_ts}" > "${raw_dir}/start_epoch.txt"
   cat /proc/diskstats > "${raw_dir}/diskstats.start"
   cat /proc/stat > "${raw_dir}/procstat.start"
-  cat /proc/meminfo > "${raw_dir}/meminfo.start"
   if command -v iostat >/dev/null 2>&1; then
-    iostat -y -mx 1 > "${raw_dir}/iostat.log" &
+    iostat -dx 1 > "${raw_dir}/iostat.log" &
     iostat_pid=$!
   else
     iostat_pid=""
     echo "iostat_not_found" > "${raw_dir}/iostat.log"
   fi
-  vmstat 1 > "${raw_dir}/vmstat.log" &
-  vmstat_pid=$!
 
-  set +e
-  /usr/bin/time -f '%e %U %S' -o "${raw_dir}/time.txt" \
-    "${cmd[@]}" >> "${out_file}" 2>&1
-  cmd_status=$?
-  set -e
+  "${cmd[@]}" >> "${out_file}" 2>&1
 
   if [[ -n "${iostat_pid}" ]]; then
     kill "${iostat_pid}" 2>/dev/null || true
     wait "${iostat_pid}" 2>/dev/null || true
   fi
-  kill "${vmstat_pid}" 2>/dev/null || true
-  wait "${vmstat_pid}" 2>/dev/null || true
 
   end_ts="$(date +%s)"
   elapsed_sec=$((end_ts - start_ts))
@@ -312,46 +288,21 @@ run_one() {
   echo "${elapsed_sec}" > "${raw_dir}/elapsed_sec.txt"
   cat /proc/diskstats > "${raw_dir}/diskstats.end"
   cat /proc/stat > "${raw_dir}/procstat.end"
-  cat /proc/meminfo > "${raw_dir}/meminfo.end"
 
   drop_page_cache "after-${run_id}"
-
-  if [[ ${cmd_status} -ne 0 ]]; then
-    echo "[ERROR] db_bench exited with status=${cmd_status}" | tee -a "${out_file}"
-    return "${cmd_status}"
-  fi
-
-  echo "[INFO] done run_id=${run_id}, cache=${cache_human}" | tee -a "${out_file}"
 }
 
-{
-  echo "run_ts=${RUN_TS}"
-  echo "run_dir=${RUN_DIR}"
-  echo "db_dir=${DB_DIR}"
-  echo "db_size=${DB_SIZE_LABEL}"
-  echo "db_size_bytes=${DB_SIZE_BYTES}"
-  echo "num=${NKEYS}"
-  echo "db_bench=${DB_BENCH}"
-  echo "cache_percentages=${CACHE_PERCENTAGES_ARR[*]}"
-  echo "threads=${THREADS}"
-  echo "reads=${NKEYS}"
-  echo "duration_seconds=${DURATION_SECONDS}"
-  echo "perf_level=${PERF_LEVEL}"
-  echo "use_numactl=${USE_NUMACTL}"
-  echo "numa_node=${NUMA_NODE}"
-  echo "max_open_files_limit=${MAX_OPEN_FILES_LIMIT}"
-  echo "workload=${WORKLOAD}"
-} > "${RUN_DIR}/session.options"
-
-for pct in "${CACHE_PERCENTAGES_ARR[@]}"; do
-  cache_bytes="$(awk -v bytes="${DB_SIZE_BYTES}" -v p="${pct}" 'BEGIN { printf "%.0f", bytes * p / 100 }')"
-  if [[ -z "${cache_bytes}" || "${cache_bytes}" -le 0 ]]; then
-    echo "[ERROR] invalid cache bytes for percent=${pct}" | tee -a "${RUN_DIR}/error.log"
-    continue
-  fi
-  echo "[INFO] start percent=${pct}, cache_bytes=${cache_bytes} ($(format_bytes "${cache_bytes}"))"
-  run_one "${pct}" "${cache_bytes}"
-  echo "[INFO] finished percent=${pct}"
+for workload in "${WORKLOADS[@]}"; do
+  for pct in "${CACHE_PERCENTAGES_ARR[@]}"; do
+    cache_bytes="$(awk -v n="${NUM}" -v p="${pct}" 'BEGIN { printf "%.0f", n * p / 100 }')"
+    if [[ -z "${cache_bytes}" || "${cache_bytes}" -le 0 ]]; then
+      echo "[ERROR] invalid cache bytes for workload=${workload}, percent=${pct}" | tee -a "${RUN_DIR}/error.log"
+      continue
+    fi
+    echo "[INFO] start workload=${workload}, percent=${pct}, cache_bytes=${cache_bytes} ($(format_bytes "${cache_bytes}"))"
+    run_one "${workload}" "${pct}" "${cache_bytes}"
+    echo "[INFO] finished workload=${workload}, percent=${pct}"
+  done
 done
 
 echo "[INFO] all runs completed. run_dir=${RUN_DIR}"
