@@ -2,10 +2,14 @@
 
 set -e
 
+DB_ROOT="${DB_ROOT:-/work/db}"
+DB_BENCH_CMD="${DB_BENCH_CMD:-/home/kdh/himeta/db_bench}"
+RESULT_ROOT="/home/kdh/eval-autometa/results"
+
 ulimit -n 1048576
 
 # Parse arguments: read_only first, workload, save_result last
-# Order: read_only, workload, metadata_type, db_size_gb, kv_size, cache_pct, threads, [level_preference], save_result
+# Order: read_only, workload, metadata_type, db_size_gb, kv_size, cache_pct, threads, [level_preference], save_result, distribution, [db_dir]
 READ_ONLY=$1
 WORKLOAD=$2
 METADATA_TYPE=$3
@@ -16,7 +20,7 @@ THREADS=$7
 
 # Min args: 8 for non-himeta, 9 for himeta
 if [ $# -lt 9 ]; then
-  echo "Usage: $0 <read_only> <workload> <metadata_type> <db_size_gb> <kv_size> <cache_pct> <threads> [<(if himeta) level_preference>] <save_result> <distribution>"
+  echo "Usage: $0 <read_only> <workload> <metadata_type> <db_size_gb> <kv_size> <cache_pct> <threads> [<(if himeta) level_preference>] <save_result> <distribution> [db_dir]"
   echo "  read_only: 0=copy db to /work/nvme/tmp and run there, 1=run on original db (read-only)"
   echo "  workload: prefix_dist | all_random | seek | ycsba | ycsbb | ycsbc | ycsbd | ycsbe | ycsbf"
   echo "  metadata_type: himeta | full | partitioned | unify"
@@ -27,12 +31,14 @@ if [ $# -lt 9 ]; then
   echo "  level_preference: (himeta only) e.g. 2,3"
   echo "  save_result: 0=tmp dir, 1=result dir"
   echo "  distribution: uniform|zipfian|latest"
+  echo "  db_dir: absolute path to the target DB directory"
   exit 1
 fi
 
 LEVEL_PREFERENCE=""
 SAVE_RESULT=$8
 DIST=$9
+DB_DIR_OVERRIDE=${10}
 if [ "$METADATA_TYPE" = "himeta" ]; then
   if [ $# -lt 9 ]; then
     echo "Error: himeta requires level_preference (8th) and save_result (9th)"
@@ -41,11 +47,33 @@ if [ "$METADATA_TYPE" = "himeta" ]; then
   LEVEL_PREFERENCE=$8
   SAVE_RESULT=$9
   DIST=${10}
+  DB_DIR_OVERRIDE=${11}
 fi
 
 DURATION=300
 if [ "$CACHE_PCT" = "5" ] || [ "$CACHE_PCT" = "2" ]; then
         DURATION=1000
+fi
+
+if [ "$WORKLOAD" = "ycsba" ]; then
+  DIST="zipfian"
+elif [ "$WORKLOAD" = "ycsbb" ]; then
+  DIST="zipfian"
+elif [ "$WORKLOAD" = "ycsbd" ]; then
+  DIST="latest"
+elif [ "$WORKLOAD" = "ycsbe" ]; then
+  DIST="uniform"
+elif [ "$WORKLOAD" = "ycsbf" ]; then
+  DIST="zipfian"
+elif [ "$WORKLOAD" = "ycsbc" ]; then
+  DIST=${DIST}
+else
+  DIST=""
+fi
+
+if [ -z "$DB_DIR_OVERRIDE" ]; then
+  echo "Error: db_dir is required"
+  exit 1
 fi
 
 # Validate read_only
@@ -69,21 +97,33 @@ if [ "$SAVE_RESULT" != "0" ] && [ "$SAVE_RESULT" != "1" ]; then
   exit 1
 fi
 
+DB_NAME=$(basename "$DB_DIR_OVERRIDE")
+
 # RESULT directory
 if [ "$SAVE_RESULT" = "0" ]; then
-  RESULT="/home/smrc/workspace_mw/results/db_bench_91B/run/tmp/${WORKLOAD}_${READ_ONLY}"
+  RESULT="${RESULT_ROOT}/tmp/${WORKLOAD}_${READ_ONLY}"
 else
-  RESULT="/home/smrc/workspace_mw/results/db_bench_91B/run/${WORKLOAD}_${READ_ONLY}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}"
+  RESULT="${RESULT_ROOT}/${DB_NAME}/${WORKLOAD}_${READ_ONLY}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}"
   if [ "$DIST" = "uniform" ] || [ "$DIST" = "zipfian" ] || [ "$DIST" = "latest" ]; then
-    RESULT="/home/smrc/workspace_mw/results/db_bench_91B/run/${WORKLOAD}_${READ_ONLY}/${DIST}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}"
+    RESULT="${RESULT_ROOT}/${DB_NAME}/${WORKLOAD}_${READ_ONLY}/${DIST}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}"
   fi
 
   if [ "$METADATA_TYPE" = "himeta" ]; then
-    RESULT="/home/smrc/workspace_mw/results/db_bench_91B/run/${WORKLOAD}_${READ_ONLY}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}_${LEVEL_PREFERENCE}"
+    RESULT="${RESULT_ROOT}/${DB_NAME}/${WORKLOAD}_${READ_ONLY}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}_${LEVEL_PREFERENCE}"
     if [ "$DIST" = "uniform" ] || [ "$DIST" = "zipfian" ] || [ "$DIST" = "latest" ]; then
-      RESULT="/home/smrc/workspace_mw/results/db_bench_91B/run/${WORKLOAD}_${READ_ONLY}/${DIST}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}_${LEVEL_PREFERENCE}"
+      RESULT="${RESULT_ROOT}/${DB_NAME}/${WORKLOAD}_${READ_ONLY}/${DIST}/${THREADS}_threads/${CACHE_PCT}p/${METADATA_TYPE}_${LEVEL_PREFERENCE}"
     fi
   fi
+fi
+
+BASE_RESULT="$RESULT"
+if [ -d "$BASE_RESULT" ]; then
+  RESULT="${BASE_RESULT}/result_1"
+  SUFFIX=1
+  while [ -d "$RESULT" ]; do
+    SUFFIX=$((SUFFIX + 1))
+    RESULT="${BASE_RESULT}/result_${SUFFIX}"
+  done
 fi
 
 # Validate metadata type
@@ -116,7 +156,12 @@ NUM=$((DB_SIZE_BYTES / BYTES_PER_KV))
 CACHE_SIZE=$(echo "scale=0; $DB_SIZE_BYTES * $CACHE_PCT / 100" | bc)
 
 # Database directory
-DIR="/work/nvme/db_bench_91B/himeta_${DB_SIZE_GB}GB"
+DIR="$DB_DIR_OVERRIDE"
+
+if [ ! -d "$DIR" ]; then
+  echo "Error: db directory not found: $DIR"
+  exit 1
+fi
 
 # Non-read-only: copy db to /work/nvme/tmp and run there
 if [ "$READ_ONLY" = "0" ]; then
@@ -168,8 +213,6 @@ DISKSTAT_BEFORE="/tmp/run_diskstat_before_$$"
 START_TIME=$(date +%s.%N)
 cat /proc/stat > "$STAT_BEFORE"
 cat /proc/diskstats > "$DISKSTAT_BEFORE"
-
-DB_BENCH_CMD="../himeta/db_bench"
 
 # Build workload-specific options
 if [ "$WORKLOAD" = "seek" ]; then
@@ -285,25 +328,42 @@ cat /proc/diskstats > "$DISKSTAT_AFTER"
 # 32 threads: aggregate "cpu" line (total across all cores)
 get_cpu_total_idle() {
   local stat_file="$1"
-  local mode="$2"
-  if [ "$mode" = "32" ]; then
-    awk '$1 == "cpu" {
-      total = 0; for (i = 2; i <= NF; i++) total += $i
-      idle = $5 + $6
-      print total+0, idle+0
-      exit
-    }' "$stat_file"
-  else
-    awk '/^cpu[0-9]+/ {
+  local thread_count="$2"
+
+  awk -v limit="$thread_count" '
+    /^cpu[0-9]+/ {
       cpu_num = substr($1, 4) + 0
-      if (cpu_num <= 30 && cpu_num % 2 == 0) {
-        total = 0; for (i = 2; i <= NF; i++) total += $i
-        idle = $5 + $6
-        sum_total += total; sum_idle += idle
+      if (limit == 16) {
+        if (cpu_num > 30 || cpu_num % 2 != 0) {
+          next
+        }
+      } else if (limit == 32) {
+        if (cpu_num > 31) {
+          next
+        }
+      } else {
+        if (cpu_num >= limit) {
+          next
+        }
+      }
+
+      total = 0
+      for (i = 2; i <= NF; i++) {
+        total += $i
+      }
+      idle = $5 + $6
+      sum_total += total
+      sum_idle += idle
+      matched += 1
+    }
+    END {
+      if (matched == 0) {
+        print 0, 0
+      } else {
+        print sum_total+0, sum_idle+0
       }
     }
-    END { print sum_total+0, sum_idle+0 }' "$stat_file"
-  fi
+  ' "$stat_file"
 }
 
 read TOTAL_BEFORE IDLE_BEFORE < <(get_cpu_total_idle "$STAT_BEFORE" "$THREADS")
