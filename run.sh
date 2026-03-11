@@ -3,13 +3,13 @@
 set -e
 
 DB_ROOT="${DB_ROOT:-/work/db}"
-DB_BENCH_CMD="${DB_BENCH_CMD:-/home/kdh/himeta/db_bench}"
-RESULT_ROOT="/home/kdh/eval-autometa/results"
+DB_BENCH_CMD="${DB_BENCH_CMD:-/home/godong/himeta/db_bench}"
+RESULT_ROOT="/home/godong/eval-autometa/results"
 
 ulimit -n 1048576
 
 # Parse arguments: read_only first, workload, save_result last
-# Order: read_only, workload, metadata_type, db_size_gb, kv_size, cache_pct, threads, [level_preference], save_result, distribution, [db_dir]
+# Order: read_only, workload, metadata_type, db_size_gb, kv_size, cache_pct, threads, [level_preference for himeta only], save_result, distribution, [db_dir]
 READ_ONLY=$1
 WORKLOAD=$2
 METADATA_TYPE=$3
@@ -23,10 +23,10 @@ if [ $# -lt 9 ]; then
   echo "Usage: $0 <read_only> <workload> <metadata_type> <db_size_gb> <kv_size> <cache_pct> <threads> [<(if himeta) level_preference>] <save_result> <distribution> [db_dir]"
   echo "  read_only: 0=copy db to /work/nvme/tmp and run there, 1=run on original db (read-only)"
   echo "  workload: prefix_dist | all_random | seek | ycsba | ycsbb | ycsbc | ycsbd | ycsbe | ycsbf"
-  echo "  metadata_type: himeta | full | partitioned | unify"
+  echo "  metadata_type: himeta | himeta_plus | full | partitioned | unify"
   echo "  db_size_gb: database size in GB"
   echo "  kv_size: 91 (key 48B, value 43B) or 1024 (key 24B, value 1000B)"
-  echo "  cache_pct: block cache size as percentage of dataset (e.g., 0.05, 0.1, 1, 2, 5, 10)"
+  echo "  cache_pct: block cache size as percentage of dataset (e.g., 0.05, 0.1, 1, 2, 4, 10)"
   echo "  threads: 16 or 32 (16=numactl node0, 32=all cores)"
   echo "  level_preference: (himeta only) e.g. 2,3"
   echo "  save_result: 0=tmp dir, 1=result dir"
@@ -50,8 +50,8 @@ if [ "$METADATA_TYPE" = "himeta" ]; then
   DB_DIR_OVERRIDE=${11}
 fi
 
-DURATION=300
-if [ "$CACHE_PCT" = "5" ] || [ "$CACHE_PCT" = "2" ]; then
+DURATION=1000
+if [ "$CACHE_PCT" = "4" ] || [ "$CACHE_PCT" = "2" ]; then
         DURATION=1000
 fi
 
@@ -128,9 +128,9 @@ fi
 
 # Validate metadata type
 case "$METADATA_TYPE" in
-  himeta|full|partitioned|unify) ;;
+  himeta|himeta_plus|full|partitioned|unify) ;;
   *)
-    echo "Error: metadata_type must be one of: himeta, full, partitioned, unify"
+    echo "Error: metadata_type must be one of: himeta, himeta_plus, full, partitioned, unify"
     exit 1
     ;;
 esac
@@ -175,8 +175,17 @@ fi
 # Build index option based on metadata type
 INDEX_OPTION=""
 if [ "$METADATA_TYPE" = "himeta" ]; then
-  #INDEX_OPTION="--use_himeta_scheme=true --metadata_format_preference=himeta --himeta_level_preference=$LEVEL_PREFERENCE --himeta_unify_full=6,6"
   INDEX_OPTION="--use_himeta_scheme=true --metadata_format_preference=himeta --himeta_level_preference=$LEVEL_PREFERENCE"
+elif [ "$METADATA_TYPE" = "himeta_plus" ]; then
+  INDEX_OPTION="\
+--use_himeta_scheme=true \
+--metadata_format_preference=himeta+ \
+--himeta_plus_eval_interval_sec=3 \
+--himeta_plus_threshold=0.99 \
+--use_stderr_info_logger \
+--stats_dump_period_sec=20 \
+--himeta_plus_switch_pct=25 \
+--himeta_plus_warmup_sec=5"
 elif [ "$METADATA_TYPE" = "unify" ]; then
   INDEX_OPTION="--use_himeta_scheme=true --metadata_format_preference=unify"
 elif [ "$METADATA_TYPE" = "partitioned" ]; then
