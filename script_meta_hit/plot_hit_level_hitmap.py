@@ -9,9 +9,8 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import ListedColormap
-from matplotlib import font_manager
-from matplotlib.transforms import Bbox
+from matplotlib import colors, font_manager
+from matplotlib.gridspec import GridSpec
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = (SCRIPT_DIR / "log_traces" / "perf_hit_ratio.csv").resolve()
@@ -26,80 +25,52 @@ METRIC_CHOICES = [
 ]
 
 METRIC_LABELS = {
-    "metadata_hit_rate": "Metadata Cache Hit Rate",
-    "block_hit_rate": "Block Cache Hit Rate",
-    "index_hit_rate": "Index Cache Hit Rate",
-    "filter_hit_rate": "Filter Cache Hit Rate",
-    "data_hit_rate": "Data Block Cache Hit Rate",
+    "metadata_hit_rate": "Metadata Hit Ratio",
+    "block_hit_rate": "Block Cache Hit Ratio",
+    "index_hit_rate": "Index Cache Hit Ratio",
+    "filter_hit_rate": "Filter Cache Hit Ratio",
+    "data_hit_rate": "Data Block Cache Hit Ratio",
 }
 
 DB_SIZE_ORDER = ["500GB", "1TB", "2TB"]
 LEVEL_ORDER = [1, 2, 3, 4, 5]
 CACHE_ORDER = [5.0, 2.0, 1.0, 0.1, 0.05]
 
-# ===== User-tunable style/layout =====
-FIGURE_SIZE = (31, 12.5)
-BASE_SCALE = 1.15
-
-COLORMAP_NAME = "coolwarm"
-COLORMAP_MAX = 0.88  # 1.0이면 최상단 색을 원본 그대로 사용
+FIGURE_WIDTH = 14.6
+FIGURE_HEIGHT = 4.6
 HEATMAP_VMIN = 0.0
 HEATMAP_VMAX = 100.0
-HEATMAP_NAN_COLOR = "#f0f0f0"
+HEATMAP_NAN_COLOR = "#f4f1eb"
+SPINE_COLOR = "#4a4a4a"
+TEXT_DARK = "#1f1f1f"
+TEXT_LIGHT = "#ffffff"
+SAVE_DPI = 320
+COLORMAP_MAX = 0.88
 
-Y_AXIS_LABEL = "Memory budget (%)"
-Y_AXIS_LABEL_PAD = 8
-
-X_TICK_FONT_BASE = 50
-X_GROUP_TICK_FONT_BASE = 70
-Y_TICK_FONT_BASE = 60
-AXIS_TITLE_FONT_BASE = 70
-CBAR_TICK_FONT_BASE = 60
-CELL_FONT_DESIRED_BASE = 50
-
-X_TICK_PAD = 10
-GROUP_AXIS_OUTWARD = 80
-GROUP_AXIS_TICK_PAD = 6
-
-CBAR_FRACTION = 0.03
-CBAR_PAD = 0.01
-CBAR_LABEL_PAD = 12
-CBAR_TICKS = [0, 20, 40, 60, 80, 100]
-
-SUBPLOT_LEFT = 0.075
-SUBPLOT_RIGHT = 0.97
-SUBPLOT_BOTTOM = 0.16
-SUBPLOT_TOP = 0.985
-
-SAVE_DPI = 200
-SAVE_PAD_LEFT_INCHES = 0.5
-SAVE_PAD_RIGHT_INCHES = 0.06
-SAVE_PAD_BOTTOM_INCHES = 0.06
-SAVE_PAD_TOP_INCHES = 0.5
-
-HEAT_VALUE_INT_THRESHOLD = 0.05
-CELL_FONT_MIN = 10
-CELL_FIT_WIDTH_RATIO = 0.82
-CELL_FIT_HEIGHT_RATIO = 0.58
+PANEL_TITLE_FONT = 34
+AXIS_LABEL_FONT = 36
+TICK_FONT = 26
+CBAR_LABEL_FONT = 36
+CBAR_TICK_FONT = 24
+CELL_FONT_MIN = 22
+CELL_FONT_MAX = 30
 
 
-def _require_times_new_roman() -> str:
+def _pick_font_family() -> str:
     available = {font.name for font in font_manager.fontManager.ttflist}
-    if "Times New Roman" not in available:
-        raise RuntimeError(
-            "Times New Roman font is required but not installed. "
-            "Install Times New Roman and rerun."
-        )
-    return "Times New Roman"
+    for name in ("Times New Roman", "Nimbus Roman", "Liberation Serif", "DejaVu Serif"):
+        if name in available:
+            return name
+    return "serif"
 
 
 plt.rcParams.update(
     {
-        "font.family": _require_times_new_roman(),
-        "axes.titlesize": 34,
-        "axes.labelsize": 30,
-        "xtick.labelsize": 24,
-        "ytick.labelsize": 24,
+        "font.family": _pick_font_family(),
+        "axes.edgecolor": SPINE_COLOR,
+        "axes.linewidth": 0.8,
+        "xtick.color": TEXT_DARK,
+        "ytick.color": TEXT_DARK,
     }
 )
 
@@ -136,8 +107,8 @@ def _read_heatmap_values(
 ) -> Dict[Tuple[str, float, int], float]:
     grouped: Dict[Tuple[str, float, int], List[float]] = defaultdict(list)
 
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
+    with path.open("r", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
         fieldnames = set(reader.fieldnames or [])
         if not fieldnames:
             raise ValueError("CSV has no header.")
@@ -146,21 +117,16 @@ def _read_heatmap_values(
             fieldnames
         )
         if is_ratio_csv:
-            required = {"db_size", "cache_pct", "level", "metric_value_ratio"}
-            missing = required - fieldnames
-            if missing:
-                raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
             for row in reader:
                 try:
                     db_size = _canonicalize_db_size(row["db_size"])
                     cache_pct = float(row["cache_pct"])
                     level = int(row["level"])
                     value = float(row["metric_value_ratio"])
-                except (ValueError, KeyError):
+                except (KeyError, ValueError):
                     continue
-
-                row_filter_kind = (row.get("filter_kind") or "").strip()
-                if filter_kind and row_filter_kind and row_filter_kind != filter_kind:
+                row_filter = (row.get("filter_kind") or "").strip()
+                if filter_kind and row_filter and row_filter != filter_kind:
                     continue
                 if db_size not in DB_SIZE_ORDER or level not in LEVEL_ORDER:
                     continue
@@ -173,173 +139,186 @@ def _read_heatmap_values(
             for row in reader:
                 try:
                     db_size = _canonicalize_db_size(row["db_size"])
-                    row_filter_kind = row["filter_kind"].strip()
+                    row_filter = row["filter_kind"].strip()
                     cache_pct = float(row["cache_pct"])
                     level = int(row["level"])
                     value = float(row[metric])
-                except (ValueError, KeyError):
+                except (KeyError, ValueError):
                     continue
-
-                if filter_kind and row_filter_kind != filter_kind:
+                if filter_kind and row_filter != filter_kind:
                     continue
-                if level == 0:
-                    continue
-                if db_size not in DB_SIZE_ORDER or level not in LEVEL_ORDER:
+                if db_size not in DB_SIZE_ORDER or level not in LEVEL_ORDER or level == 0:
                     continue
                 grouped[(db_size, cache_pct, level)].append(value)
 
-    return {k: sum(v) / len(v) for k, v in grouped.items() if v}
+    return {key: sum(values) / len(values) for key, values in grouped.items() if values}
 
 
-def _format_heat_value(v: float) -> str:
-    rounded = round(v)
-    if abs(v - rounded) < HEAT_VALUE_INT_THRESHOLD:
-        return str(int(rounded))
-    return f"{v:.1f}"
-
-
-def _fit_cell_fontsize(
-    fig: plt.Figure,
-    ax: plt.Axes,
-    n_rows: int,
-    n_cols: int,
-    desired_size: int,
-) -> int:
-    # Fit annotation text to cell geometry to avoid overflow.
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    bbox = ax.get_window_extent(renderer=renderer)
-    cell_w_pt = (bbox.width / n_cols) * 72.0 / fig.dpi
-    cell_h_pt = (bbox.height / n_rows) * 72.0 / fig.dpi
-    max_size = int(min(cell_w_pt * CELL_FIT_WIDTH_RATIO, cell_h_pt * CELL_FIT_HEIGHT_RATIO))
-    return max(CELL_FONT_MIN, min(desired_size, max_size))
-
-
-def _save_figure_with_padding(fig: plt.Figure, output_png: Path) -> None:
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    tight_bbox = fig.get_tightbbox(renderer)
-    padded_bbox = Bbox.from_extents(
-        tight_bbox.x0 - SAVE_PAD_LEFT_INCHES,
-        tight_bbox.y0 - SAVE_PAD_BOTTOM_INCHES,
-        tight_bbox.x1 + SAVE_PAD_RIGHT_INCHES,
-        tight_bbox.y1 + SAVE_PAD_TOP_INCHES,
-    )
-    fig.savefig(output_png, dpi=SAVE_DPI, bbox_inches=padded_bbox)
-
-
-def plot_hit_level_hitmap(
-    values: Dict[Tuple[str, float, int], float],
-    output_png: Path,
-    metric: str,
-    filter_kind: str,
-    font_scale: float = 1.0,
-) -> None:
-    n_rows = len(CACHE_ORDER)
-    n_cols = len(DB_SIZE_ORDER) * len(LEVEL_ORDER)
-
-    matrix = np.full((n_rows, n_cols), np.nan)
-    x_labels: List[str] = []
-
+def _build_matrix(values: Dict[Tuple[str, float, int], float]) -> np.ndarray:
+    matrix = np.full((len(CACHE_ORDER), len(DB_SIZE_ORDER) * len(LEVEL_ORDER)), np.nan)
     for db_idx, db_size in enumerate(DB_SIZE_ORDER):
         for level_idx, level in enumerate(LEVEL_ORDER):
             col_idx = db_idx * len(LEVEL_ORDER) + level_idx
-            x_labels.append(f"L{level}")
             for row_idx, cache_pct in enumerate(CACHE_ORDER):
                 value = values.get((db_size, cache_pct, level))
                 if value is not None:
                     matrix[row_idx, col_idx] = value * 100.0
+    return matrix
 
-    if np.isnan(matrix).all():
-        raise ValueError("No valid rows found for heatmap.")
 
-    fig, ax = plt.subplots(figsize=FIGURE_SIZE)
-    effective_scale = BASE_SCALE * font_scale
-    base_cmap = plt.get_cmap(COLORMAP_NAME)
-    cmap = ListedColormap(base_cmap(np.linspace(0.0, COLORMAP_MAX, 256)))
-    cmap.set_bad(color=HEATMAP_NAN_COLOR)
-    image = ax.imshow(matrix, aspect="auto", cmap=cmap, vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX)
-    x_tick_size = round(X_TICK_FONT_BASE * effective_scale)
-    x_group_tick_size = round(X_GROUP_TICK_FONT_BASE * effective_scale)
-    axis_title_size = round(AXIS_TITLE_FONT_BASE * effective_scale)
+def _format_heat_value(value: float) -> str:
+    rounded = round(value)
+    if abs(value - rounded) < 0.05:
+        return str(int(rounded))
+    return f"{value:.1f}"
 
-    plt.xticks(range(n_cols), x_labels, fontsize=x_tick_size)
-    plt.yticks(
-        range(n_rows),
-        [f"{pct:g}" for pct in CACHE_ORDER],
-        fontsize=round(Y_TICK_FONT_BASE * effective_scale),
-    )
 
-    plt.ylabel(
-        Y_AXIS_LABEL,
-        fontsize=axis_title_size,
-        labelpad=Y_AXIS_LABEL_PAD,
-    )
-    ax.tick_params(axis="x", which="both", pad=X_TICK_PAD)
-    group_ax = ax.secondary_xaxis("bottom")
-    group_ax.spines["bottom"].set_position(("outward", GROUP_AXIS_OUTWARD))
-    group_ax.spines["bottom"].set_visible(False)
-    group_centers = []
+def _annotation_color(value: float, cmap, norm) -> str:
+    r, g, b, _ = cmap(norm(value))
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return TEXT_DARK if luminance > 0.62 else TEXT_LIGHT
+
+
+def _draw_heatmap(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    matrix: np.ndarray,
+    cmap,
+    norm,
+    font_scale: float,
+) -> None:
+    ax.imshow(matrix, cmap=cmap, norm=norm, aspect="auto", interpolation="nearest")
+
+    x_labels = [f"L{level}" for _ in DB_SIZE_ORDER for level in LEVEL_ORDER]
+    ax.set_xticks(range(matrix.shape[1]))
+    ax.set_xticklabels(x_labels, fontsize=round(TICK_FONT * font_scale))
+
+    ax.set_yticks(range(len(CACHE_ORDER)))
+    ax.set_yticklabels([f"{pct:g}" for pct in CACHE_ORDER], fontsize=round(TICK_FONT * font_scale))
+    ax.set_ylabel("Memory budget (%)", fontsize=round(AXIS_LABEL_FONT * font_scale), labelpad=16)
+
+    ax.tick_params(axis="both", which="major", length=0)
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    for divider_idx in range(1, len(DB_SIZE_ORDER)):
+        ax.axvline(
+            divider_idx * len(LEVEL_ORDER) - 0.5,
+            color="#ffffff",
+            linewidth=2.4,
+        )
+
     for db_idx, db_size in enumerate(DB_SIZE_ORDER):
-        start = db_idx * len(LEVEL_ORDER)
-        end = start + len(LEVEL_ORDER) - 1
-        group_centers.append((start + end) / 2.0)
-    group_ax.set_xticks(group_centers)
-    group_ax.set_xticklabels(DB_SIZE_ORDER, fontsize=x_group_tick_size)
-    group_ax.tick_params(axis="x", which="both", length=0, pad=GROUP_AXIS_TICK_PAD)
+        center = db_idx * len(LEVEL_ORDER) + (len(LEVEL_ORDER) - 1) / 2.0
+        ax.text(
+            center,
+            -0.18,
+            db_size,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=round(AXIS_LABEL_FONT * font_scale),
+            fontweight="semibold",
+        )
 
-    metric_label = METRIC_LABELS.get(metric, metric)
-
-    cbar_label = (
-        "Metadata hit ratio (%)"
-        if metric == "metadata_hit_rate"
-        else f"{metric_label} (%)"
-    )
-    cbar = plt.colorbar(image, fraction=CBAR_FRACTION, pad=CBAR_PAD)
-    cbar.set_label(cbar_label, fontsize=axis_title_size, labelpad=CBAR_LABEL_PAD)
-    cbar.set_ticks(CBAR_TICKS)
-    cbar.set_ticklabels([f"{t}" for t in CBAR_TICKS])
-    cbar.ax.tick_params(labelsize=round(CBAR_TICK_FONT_BASE * effective_scale))
-
-    plt.subplots_adjust(
-        left=SUBPLOT_LEFT,
-        right=SUBPLOT_RIGHT,
-        bottom=SUBPLOT_BOTTOM,
-        top=SUBPLOT_TOP,
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bbox = ax.get_window_extent(renderer=renderer)
+    cell_w_pt = (bbox.width / matrix.shape[1]) * 72.0 / fig.dpi
+    cell_h_pt = (bbox.height / matrix.shape[0]) * 72.0 / fig.dpi
+    cell_font = max(
+        round(CELL_FONT_MIN * font_scale),
+        min(
+            round(CELL_FONT_MAX * font_scale),
+            int(min(cell_w_pt * 0.44, cell_h_pt * 0.50)),
+        ),
     )
 
-    cell_font = _fit_cell_fontsize(
-        fig,
-        ax,
-        n_rows=n_rows,
-        n_cols=n_cols,
-        desired_size=round(CELL_FONT_DESIRED_BASE * effective_scale),
-    )
-    for row_idx in range(n_rows):
-        for col_idx in range(n_cols):
-            v = matrix[row_idx, col_idx]
-            if math.isnan(v):
+    for row_idx in range(matrix.shape[0]):
+        for col_idx in range(matrix.shape[1]):
+            value = matrix[row_idx, col_idx]
+            if math.isnan(value):
                 continue
-            text_color = "white" if v >= 60.0 else "black"
             ax.text(
                 col_idx,
                 row_idx,
-                _format_heat_value(v),
+                _format_heat_value(value),
                 ha="center",
                 va="center",
                 fontsize=cell_font,
-                color=text_color,
-                clip_on=True,
+                fontweight="semibold",
+                color=_annotation_color(value, cmap, norm),
             )
 
+
+def plot_hit_level_hitmap(
+    input_csv: Path,
+    output_png: Path,
+    metric: str,
+    font_scale: float,
+    filter_kind: str,
+) -> None:
+    values = _read_heatmap_values(input_csv, metric, filter_kind)
+    if not values:
+        raise ValueError("No valid rows found for heatmap.")
+
+    matrix = _build_matrix(values)
+    if np.isnan(matrix).all():
+        raise ValueError("No valid rows found for heatmap.")
+
+    base_cmap = plt.get_cmap("coolwarm")
+    cmap = colors.ListedColormap(base_cmap(np.linspace(0.0, COLORMAP_MAX, 256)))
+    cmap.set_bad(HEATMAP_NAN_COLOR)
+    norm = colors.Normalize(vmin=HEATMAP_VMIN, vmax=HEATMAP_VMAX)
+
+    fig = plt.figure(figsize=(FIGURE_WIDTH, FIGURE_HEIGHT))
+    gs = GridSpec(
+        nrows=1,
+        ncols=2,
+        figure=fig,
+        width_ratios=[1, 0.028],
+        left=0.065,
+        right=0.91,
+        bottom=0.22,
+        top=0.96,
+        wspace=0.015,
+    )
+
+    ax = fig.add_subplot(gs[0, 0])
+    cax = fig.add_subplot(gs[0, 1])
+
+    _draw_heatmap(
+        fig=fig,
+        ax=ax,
+        matrix=matrix,
+        cmap=cmap,
+        norm=norm,
+        font_scale=font_scale,
+    )
+
+    metric_label = METRIC_LABELS.get(metric, metric)
+    cbar = fig.colorbar(
+        plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+        cax=cax,
+        ticks=[0, 20, 40, 60, 80, 100],
+    )
+    cbar.set_label(
+        "Metadata Hit (%)" if metric == "metadata_hit_rate" else f"{metric_label} (%)",
+        fontsize=round(CBAR_LABEL_FONT * font_scale),
+        labelpad=12,
+    )
+    cbar.ax.tick_params(labelsize=round(CBAR_TICK_FONT * font_scale), length=4)
+    cbar.ax.set_aspect("auto")
+
     output_png.parent.mkdir(parents=True, exist_ok=True)
-    _save_figure_with_padding(fig, output_png)
+    fig.savefig(output_png, dpi=SAVE_DPI, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot hit-ratio heatmap for DB sizes 500GB/1TB/2TB and levels 1-5"
+        description="Plot hit-ratio heatmap grouped by DB size and metadata level."
     )
     parser.add_argument(
         "input_csv",
@@ -356,33 +335,36 @@ def main() -> None:
     parser.add_argument(
         "--output",
         default=str(DEFAULT_OUTPUT),
-        help="Output PNG path",
+        help="Output PNG path.",
     )
     parser.add_argument(
         "--metric",
         choices=METRIC_CHOICES,
         default="metadata_hit_rate",
-        help="Metric column used when input is raw metadata CSV",
+        help="Metric to plot.",
     )
     parser.add_argument(
         "--filter-kind",
-        default="full",
-        help="Filter kind to include (default: full). If empty, include all filter kinds.",
+        default="",
+        help="Optional filter_kind filter.",
     )
     parser.add_argument(
         "--font-scale",
         type=float,
         default=1.0,
-        help="Global font scale (default: 1.0)",
+        help="Global font scale multiplier.",
     )
     args = parser.parse_args()
 
-    input_path = Path(args.input_opt or args.input_csv or DEFAULT_INPUT)
-    output_path = Path(args.output)
-    filter_kind = args.filter_kind.strip()
-
-    values = _read_heatmap_values(input_path, args.metric, filter_kind)
-    plot_hit_level_hitmap(values, output_path, args.metric, filter_kind, args.font_scale)
+    input_csv = Path(args.input_opt or args.input_csv or str(DEFAULT_INPUT))
+    output_png = Path(args.output)
+    plot_hit_level_hitmap(
+        input_csv=input_csv,
+        output_png=output_png,
+        metric=args.metric,
+        font_scale=args.font_scale,
+        filter_kind=args.filter_kind,
+    )
 
 
 if __name__ == "__main__":

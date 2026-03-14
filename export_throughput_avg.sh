@@ -3,7 +3,7 @@
 set -euo pipefail
 
 RESULT_ROOT="results"
-OUTPUT_CSV="throughput_results.csv"
+OUTPUT_CSV=""
 
 usage() {
   echo "Usage: $0 [-i|--input-dir <result_root>] [-o|--output <output_csv>] [result_root] [output_csv]" >&2
@@ -54,9 +54,18 @@ if [[ $# -ge 2 ]]; then
   OUTPUT_CSV="$2"
 fi
 
+if [[ "${RESULT_ROOT}" != "/" ]]; then
+  RESULT_ROOT="${RESULT_ROOT%/}"
+fi
+
 if [[ ! -d "${RESULT_ROOT}" ]]; then
   echo "Error: result root not found: ${RESULT_ROOT}" >&2
   exit 1
+fi
+
+if [[ -z "${OUTPUT_CSV}" ]]; then
+  input_dir_name="${RESULT_ROOT##*/}"
+  OUTPUT_CSV="tp_${input_dir_name}.csv"
 fi
 
 extract_throughput() {
@@ -80,11 +89,12 @@ csv_escape() {
   printf '"%s"' "${value}"
 }
 
-echo "db_name,workload,read_only,distribution,threads,cache_pct,scheme,level_preference,throughput_ops_sec,stdout_path" > "${OUTPUT_CSV}"
+parse_result_metadata() {
+  local result_file="$1"
+  local suffix="$2"
 
-while IFS= read -r stdout_file; do
-  rel_path="${stdout_file#${RESULT_ROOT}/}"
-  dir_path="${rel_path%/stdout.txt}"
+  rel_path="${result_file#${RESULT_ROOT}/}"
+  dir_path="${rel_path%/${suffix}}"
 
   IFS='/' read -r -a parts <<< "${dir_path}"
   db_name="${parts[0]}"
@@ -114,7 +124,29 @@ while IFS= read -r stdout_file; do
     scheme="himeta"
     level_preference="${scheme_part#himeta_}"
   fi
+}
 
+scheme_rank() {
+  case "$1" in
+    full) printf '0' ;;
+    partitioned) printf '1' ;;
+    unify) printf '2' ;;
+    himeta|himeta_*) printf '3' ;;
+    *) printf '9' ;;
+  esac
+}
+
+emit_sorted_result_files() {
+  while IFS= read -r result_file; do
+    parse_result_metadata "${result_file}" "stdout.txt"
+    printf '%s\t%s\n' "${dir_path%/${scheme_part}}/$(scheme_rank "${scheme_part}")_${scheme_part}" "${result_file}"
+  done < <(find "${RESULT_ROOT}" -type f -name stdout.txt) | sort | cut -f2-
+}
+
+echo "db_name,workload,read_only,distribution,threads,cache_pct,scheme,level_preference,throughput_ops_sec,stdout_path" > "${OUTPUT_CSV}"
+
+while IFS= read -r stdout_file; do
+  parse_result_metadata "${stdout_file}" "stdout.txt"
   throughput="$(extract_throughput "${stdout_file}")"
   if [[ -z "${throughput}" ]]; then
     continue
@@ -131,6 +163,6 @@ while IFS= read -r stdout_file; do
     "$(csv_escape "${level_preference}")" \
     "$(csv_escape "${throughput}")" \
     "$(csv_escape "${stdout_file}")" >> "${OUTPUT_CSV}"
-done < <(find "${RESULT_ROOT}" -type f -name stdout.txt | sort)
+done < <(emit_sorted_result_files)
 
 echo "Wrote ${OUTPUT_CSV}"

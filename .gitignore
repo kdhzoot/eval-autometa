@@ -6,3 +6,4 @@ log*
 *.txt
 *.run   
 results*
+__pycache__

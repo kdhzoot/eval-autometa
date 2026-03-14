@@ -5,24 +5,23 @@
 
 # Byte
 KV_SIZE=91
-RESULT_ROOT="/home/godong/eval-autometa/results"
+RESULT_ROOT="/home/smrc/autometa/eval-autometa/results"
 
-THREAD=64
+THREAD=96
 DB_CASES=(
-        "2200:/work/2200gb_himeta"
-        # "3072:/work/himeta_3072GB"
-        # "2000:/work/2000gb_fillseqow"
+        "2200:/work/db/2200gb_himeta"
 )
 
 # CACHE_SIZE=(1)
-CACHE_SIZE=(1 2 4)
+CACHE_SIZE=(1 2 5)
 # CACHE_SIZE=(0.05 0.1 1 2 4 10)
 SCHEME=("himeta_plus")
-# SCHEME=("himeta_plus" "unify" "partitioned" "full")
+# SCHEME=("himeta_plus" "unify" "full" "partitioned")
+# SCHEME=("himeta_plus" "unify" "full")
 WORKLOAD_CASES=(
+        "prefix_dist:"
         "ycsbc:uniform"
         "ycsbc:zipfian"
-        "prefix_dist:"
 )
 
 resolve_dist() {

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 : <<'EXAMPLE'
-TARGET_DB_GB=2500 KV_SIZE=91 CACHE_SIZE_GB=8 \
-DB_BENCH=/home/smrc/autometa/himeta/db_bench \
+TARGET_DB_GB=2200 KV_SIZE=91 CACHE_SIZE_GB=8 \
+DB_BENCH=/home/smrc/autometa/rocksdb/db_bench \
 DB_ROOT=/work/db USE_NUMACTL=0 NUMA_NODE=0 \
-bash load_hi.sh
+bash load_ribbon.sh
 EXAMPLE
 
 set -euo pipefail
@@ -18,7 +18,7 @@ Usage:
   DB_ROOT=<path> \
   USE_NUMACTL=<0|1> \
   NUMA_NODE=<node> \
-  bash load_hi.sh
+  bash load_ribbon.sh
 USAGE
 }
 
@@ -47,8 +47,8 @@ fi
 LOG_ROOT="log_loads"
 MAX_OPEN_FILES_LIMIT=1048576
 RUN_TS="$(date '+%y%m%d_%H%M')"
-RUN_DIR="${LOG_ROOT}/load_${RUN_TS}_${TARGET_DB_GB}gb"
-DB_DIR="${DB_ROOT%/}/${TARGET_DB_GB}gb_himeta"
+RUN_DIR="${LOG_ROOT}/load_ribbon_${RUN_TS}_${TARGET_DB_GB}gb"
+DB_DIR="${DB_ROOT%/}/${TARGET_DB_GB}gb_ribbon"
 OUT_FILE="${RUN_DIR}/default.out"
 OPTIONS_FILE="${RUN_DIR}/default.options"
 RAW_DIR="${RUN_DIR}/raw"
@@ -73,8 +73,7 @@ fi
 cmd=(
   "${cmd_prefix[@]}"
   "${DB_BENCH}"
-  # --benchmarks=filluniquerandom,stats,levelstats
-  --benchmarks=fillrandom,stats,levelstats
+  --benchmarks=filluniquerandom,stats,levelstats
   --statistics=1
   --stats_interval_seconds=60
   --stats_per_interval=1
@@ -87,6 +86,10 @@ cmd=(
   --cache_index_and_filter_blocks=true
   --enable_index_compression=false
   --index_shortening_mode=1
+  --partition_index=true
+  --partition_index_and_filters=true
+  --pin_l0_filter_and_index_blocks_in_cache=false
+  --use_ribbon_filter=true
   --bloom_bits=10
   --disable_wal=true
   --open_files=-1
@@ -116,7 +119,6 @@ cmd=(
   --use_direct_io_for_flush_and_compaction=true
   --compression_type=none
   --checksum_type=1
-  --use-himeta-scheme=true
 )
 
 {
@@ -138,6 +140,9 @@ cmd=(
   echo "nkeys=${NKEYS}"
   echo "report_file=${RUN_DIR}/default.rep"
   echo "benchmarks=filluniquerandom,stats,levelstats"
+  echo "filter=ribbon"
+  echo "partition_index=true"
+  echo "partition_index_and_filters=true"
 } > "${OPTIONS_FILE}"
 
 {

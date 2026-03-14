@@ -3,8 +3,9 @@
 set -e
 
 DB_ROOT="${DB_ROOT:-/work/db}"
-DB_BENCH_CMD="${DB_BENCH_CMD:-/home/godong/himeta/db_bench}"
-RESULT_ROOT="/home/godong/eval-autometa/results"
+DB_BENCH_CMD="${DB_BENCH_CMD:-/home/smrc/autometa/himeta/db_bench}"
+RESULT_ROOT="${RESULT_ROOT:-/home/smrc/autometa/eval-autometa/results}"
+TMP_ROOT="${TMP_ROOT:-/work/tmp}"
 
 ulimit -n 1048576
 
@@ -18,10 +19,10 @@ KV_SIZE=$5
 CACHE_PCT=$6
 THREADS=$7
 
-# Min args: 8 for non-himeta, 9 for himeta
-if [ $# -lt 9 ]; then
+# Min args: 10 for non-himeta, 11 for himeta
+if [ $# -lt 10 ]; then
   echo "Usage: $0 <read_only> <workload> <metadata_type> <db_size_gb> <kv_size> <cache_pct> <threads> [<(if himeta) level_preference>] <save_result> <distribution> [db_dir]"
-  echo "  read_only: 0=copy db to /work/nvme/tmp and run there, 1=run on original db (read-only)"
+  echo "  read_only: 0=copy db to a temp dir under ${TMP_ROOT} and run there, 1=run on original db"
   echo "  workload: prefix_dist | all_random | seek | ycsba | ycsbb | ycsbc | ycsbd | ycsbe | ycsbf"
   echo "  metadata_type: himeta | himeta_plus | full | partitioned | unify"
   echo "  db_size_gb: database size in GB"
@@ -40,8 +41,8 @@ SAVE_RESULT=$8
 DIST=$9
 DB_DIR_OVERRIDE=${10}
 if [ "$METADATA_TYPE" = "himeta" ]; then
-  if [ $# -lt 9 ]; then
-    echo "Error: himeta requires level_preference (8th) and save_result (9th)"
+  if [ $# -lt 11 ]; then
+    echo "Error: himeta requires level_preference, save_result, distribution, and db_dir"
     exit 1
   fi
   LEVEL_PREFERENCE=$8
@@ -50,9 +51,9 @@ if [ "$METADATA_TYPE" = "himeta" ]; then
   DB_DIR_OVERRIDE=${11}
 fi
 
-DURATION=1000
-if [ "$CACHE_PCT" = "4" ] || [ "$CACHE_PCT" = "2" ]; then
-        DURATION=1000
+DURATION=180
+if [ "$CACHE_PCT" = "5" ] || [ "$CACHE_PCT" = "2" ]; then
+        DURATION=180
 fi
 
 if [ "$WORKLOAD" = "ycsba" ]; then
@@ -163,15 +164,25 @@ if [ ! -d "$DIR" ]; then
   exit 1
 fi
 
-# Non-read-only: copy db to /work/nvme/tmp and run there
+# Non-read-only: stage DB in a per-run temp dir with a full copy.
 if [ "$READ_ONLY" = "0" ]; then
-  rm -rf /work/nvme/tmp
-  mkdir -p /work/nvme/tmp
-  cp $DIR/* /work/nvme/tmp/
-  DIR="/work/nvme/tmp"
-  trap 'rm -rf /work/nvme/tmp' EXIT
+  DB_BASENAME=$(basename "$DIR")
+  mkdir -p "$TMP_ROOT"
+  TMP_DIR=$(mktemp -d "${TMP_ROOT}/${DB_BASENAME}.XXXXXX")
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  echo "Staging DB into temp dir: $TMP_DIR"
+  # Full-copy fallback kept for reference.
+  # cp -r "$DIR"/. "$TMP_DIR"/
+
+  # Faster staging path: hard-link immutable SSTs and copy the mutable metadata/log files.
+  find "$DIR" -maxdepth 1 -type f -name '*.sst' -exec ln -t "$TMP_DIR" {} +
+  find "$DIR" -maxdepth 1 -type f ! -name '*.sst' -exec cp -a -t "$TMP_DIR" {} +
+  echo "DB copy completed: $DIR -> $TMP_DIR"
+  DIR="$TMP_DIR"
 fi
 
+# himeta_plus_last_level_switch_pct 
+# himeta_plus_switch_pct
 # Build index option based on metadata type
 INDEX_OPTION=""
 if [ "$METADATA_TYPE" = "himeta" ]; then
@@ -185,7 +196,8 @@ elif [ "$METADATA_TYPE" = "himeta_plus" ]; then
 --use_stderr_info_logger \
 --stats_dump_period_sec=20 \
 --himeta_plus_switch_pct=25 \
---himeta_plus_warmup_sec=5"
+--himeta_plus_warmup_sec=3 \
+--himeta_plus_min_eval_level=3" 
 elif [ "$METADATA_TYPE" = "unify" ]; then
   INDEX_OPTION="--use_himeta_scheme=true --metadata_format_preference=unify"
 elif [ "$METADATA_TYPE" = "partitioned" ]; then
@@ -229,22 +241,22 @@ if [ "$WORKLOAD" = "seek" ]; then
   WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --max_scan_distance=5000 --seek_nexts=100"
 elif [ "$WORKLOAD" = "ycsba" ]; then
   BENCHMARKS="workloada,stats,levelstats"
-  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS"
+  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --ycsb_requestdistribution=${DIST}"
 elif [ "$WORKLOAD" = "ycsbb" ]; then
   BENCHMARKS="workloadb,stats,levelstats"
-  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS"
+  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --ycsb_requestdistribution=${DIST}"
 elif [ "$WORKLOAD" = "ycsbc" ]; then
   BENCHMARKS="workloadc,stats,levelstats"
   WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --ycsb_requestdistribution=${DIST}"
 elif [ "$WORKLOAD" = "ycsbd" ]; then
   BENCHMARKS="workloadd,stats,levelstats"
-  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS"
+  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --ycsb_requestdistribution=${DIST}"
 elif [ "$WORKLOAD" = "ycsbe" ]; then
   BENCHMARKS="workloade,stats,levelstats"
-  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS"
+  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --ycsb_requestdistribution=${DIST}"
 elif [ "$WORKLOAD" = "ycsbf" ]; then
   BENCHMARKS="workloadf,stats,levelstats"
-  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS"
+  WORKLOAD_OPTS="--benchmarks=$BENCHMARKS --ycsb_requestdistribution=${DIST}"
 else
   # prefix_dist or all_random: mixgraph
   BENCHMARKS="mixgraph,stats,levelstats"
